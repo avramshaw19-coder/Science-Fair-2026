@@ -1,0 +1,222 @@
+<#
+run_primes.ps1
+PowerShell harness to benchmark "Prime Counting" across 5 languages with:
+- 1 warm-up run (discarded)
+- N measured trials
+- Output parsing (seconds, primes, checksum)
+- Consistency check across languages (primes + checksum must match for same N)
+- Results written to CSV: results\trials.csv
+
+Assumptions / expected repo layout (customize paths below if yours differs):
+bench\
+  impl\
+    python\prime.py
+    node\prime.js
+    go\prime.go
+    java\Prime.java
+    csharp\primes_cs\Program.cs  (a dotnet console project folder)
+  results\  (created if missing)
+
+Usage examples:
+  powershell -ExecutionPolicy Bypass -File .\run_primes.ps1 -N 300000 -Trials 5
+  .\run_primes.ps1 -N 1000000 -Trials 7 -Warmup 1 -OutCsv .\results\trials.csv
+#>
+
+[CmdletBinding()]
+param(
+  [int]$N = 300000,
+  [int]$Warmup = 1,
+  [int]$Trials = 5,
+  [string]$OutCsv = ".\results\trials.csv",
+  [switch]$SkipBuild
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# Paths (edit here if needed)
+# -----------------------------
+$Root = Resolve-Path "."
+
+$ImplPython = Join-Path $Root "impl\python\prime.py"
+$ImplNode   = Join-Path $Root "impl\node\prime.js"
+$ImplGo     = Join-Path $Root "impl\go\prime.go"
+$ImplJava   = Join-Path $Root "impl\java\Prime.java"
+
+# For C#, point to the directory containing the .csproj
+# Example: impl\csharp\primes_cs\primes_cs.csproj lives under this folder
+$ImplCSharpProjDir = Join-Path $Root "impl\csharp\primes_cs"
+
+# For Java, we'll compile to this folder:
+$JavaOutDir = Join-Path $Root "impl\java\out"
+
+# Results folder
+$ResultsDir = Split-Path -Parent (Resolve-Path (Join-Path $Root $OutCsv) -ErrorAction SilentlyContinue)
+if (-not $ResultsDir) {
+  # If OutCsv doesn't exist yet, compute directory from string
+  $ResultsDir = Split-Path -Parent (Join-Path $Root $OutCsv)
+}
+if (-not (Test-Path $ResultsDir)) { New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null }
+
+# -----------------------------
+# Helpers
+# -----------------------------
+function Get-CommandVersionLine {
+  param([string]$Exe, [string[]]$Args)
+  try {
+    $p = Start-Process -FilePath $Exe -ArgumentList $Args -NoNewWindow -RedirectStandardOutput -RedirectStandardError -PassThru -Wait
+    $stdout = Get-Content $p.StandardOutput.BaseStream -Raw
+    $stderr = Get-Content $p.StandardError.BaseStream -Raw
+    $text = ($stdout + "`n" + $stderr).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+    # Return first non-empty line
+    return ($text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+  } catch {
+    return ""
+  }
+}
+
+function Ensure-Exists {
+  param([string]$Path, [string]$Label)
+  if (-not (Test-Path $Path)) {
+    throw "Missing $Label at: $Path"
+  }
+}
+
+function Parse-PrimeOutput {
+  param([string]$Line)
+
+  # Expected line format like:
+  # language=python, workload=primes, n=300000, primes=25997, seconds=0.123456, checksum=12345
+  $pattern = 'language=(?<language>[^,]+),\s*workload=(?<workload>[^,]+),\s*n=(?<n>\d+),\s*primes=(?<primes>\d+),\s*seconds=(?<seconds>[0-9.]+),\s*checksum=(?<checksum>\d+)'
+  $m = [regex]::Match($Line, $pattern)
+  if (-not $m.Success) {
+    throw "Could not parse output line: $Line"
+  }
+
+  return [pscustomobject]@{
+    language = $m.Groups["language"].Value.Trim()
+    workload = $m.Groups["workload"].Value.Trim()
+    n        = [int]$m.Groups["n"].Value
+    primes   = [int]$m.Groups["primes"].Value
+    seconds  = [double]$m.Groups["seconds"].Value
+    checksum = [int]$m.Groups["checksum"].Value
+  }
+}
+
+function Run-And-CaptureLine {
+  param(
+    [string]$Exe,
+    [string[]]$Args
+  )
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Exe
+  $psi.Arguments = ($Args -join " ")
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError  = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+
+  [void]$p.Start()
+  $stdout = $p.StandardOutput.ReadToEnd()
+  $stderr = $p.StandardError.ReadToEnd()
+  $p.WaitForExit()
+
+  if ($p.ExitCode -ne 0) {
+    throw "Command failed (exit $($p.ExitCode)): $Exe $($psi.Arguments)`nSTDERR:`n$stderr`nSTDOUT:`n$stdout"
+  }
+
+  # Prefer the last non-empty line of stdout (some runtimes may print banners)
+  $lines = ($stdout -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  if ($lines.Count -eq 0) {
+    throw "No output captured from: $Exe $($psi.Arguments)`nSTDERR:`n$stderr"
+  }
+  return $lines[-1].Trim()
+}
+
+function Write-TrialRow {
+  param(
+    [string]$CsvPath,
+    [pscustomobject]$Row
+  )
+  $exists = Test-Path $CsvPath
+  if (-not $exists) {
+    $Row | Export-Csv -Path $CsvPath -NoTypeInformation
+  } else {
+    $Row | Export-Csv -Path $CsvPath -NoTypeInformation -Append
+  }
+}
+
+# -----------------------------
+# Preflight checks
+# -----------------------------
+Ensure-Exists $ImplPython "Python prime.py"
+Ensure-Exists $ImplNode   "Node prime.js"
+Ensure-Exists $ImplGo     "Go prime.go"
+Ensure-Exists $ImplJava   "Java Prime.java"
+Ensure-Exists $ImplCSharpProjDir "C# project directory"
+
+# -----------------------------
+# Capture system + tool versions
+# -----------------------------
+$machine = $env:COMPUTERNAME
+$osLine  = (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption) + " " +
+           (Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Version)
+$cpuLine = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()
+$cores   = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty NumberOfLogicalProcessors)
+
+$pythonVer = Get-CommandVersionLine -Exe "python" -Args @("--version")
+$nodeVer   = Get-CommandVersionLine -Exe "node"   -Args @("--version")
+$goVer     = Get-CommandVersionLine -Exe "go"     -Args @("version")
+$javaVer   = Get-CommandVersionLine -Exe "java"   -Args @("-version")
+$dotnetVer = Get-CommandVersionLine -Exe "dotnet" -Args @("--version")
+
+Write-Host "Machine: $machine"
+Write-Host "OS:      $osLine"
+Write-Host "CPU:     $cpuLine"
+Write-Host "Cores:   $cores"
+Write-Host "Python:  $pythonVer"
+Write-Host "Node:    $nodeVer"
+Write-Host "Go:      $goVer"
+Write-Host "Java:    $javaVer"
+Write-Host ".NET:    $dotnetVer"
+Write-Host ""
+
+# -----------------------------
+# Build steps (unless -SkipBuild)
+# -----------------------------
+if (-not $SkipBuild) {
+  Write-Host "== Building (Release) =="
+  # Go: no prebuild needed (we can go run), but compiling is faster/more consistent
+  $GoExe = Join-Path $Root "impl\go\prime_go.exe"
+  & go build -o $GoExe $ImplGo
+  if ($LASTEXITCODE -ne 0) { throw "Go build failed." }
+
+  # Java: compile to out dir
+  if (-not (Test-Path $JavaOutDir)) { New-Item -ItemType Directory -Force -Path $JavaOutDir | Out-Null }
+  & javac -d $JavaOutDir $ImplJava
+  if ($LASTEXITCODE -ne 0) { throw "javac failed." }
+
+  # C#: build Release
+  Push-Location $ImplCSharpProjDir
+  try {
+    & dotnet build -c Release | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw ".NET build failed." }
+  } finally {
+    Pop-Location
+  }
+
+  Write-Host ""
+} else {
+  # If skipping build, still define Go exe path for later
+  $GoExe = Join-Path $Root "impl\go\prime_go.exe"
+}
+
+# -----------------------------
+# Define runners
+# -----------------------------
+$runners = @
